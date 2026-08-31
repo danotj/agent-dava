@@ -78,6 +78,23 @@ class EventoProcesado(Base):
     creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora, index=True)
 
 
+class ConversacionPausada(Base):
+    """
+    Conversaciones donde un humano del equipo tomo el control.
+
+    Mientras una conversacion esta aca, el bot recibe el mensaje (se marca como
+    procesado para no reintentar), pero NO llama al LLM ni responde: se asume que
+    alguien del equipo esta contestando a mano desde el dashboard del proveedor.
+    """
+
+    __tablename__ = "conversaciones_pausadas"
+
+    telefono: Mapped[str] = mapped_column(String(50), primary_key=True)
+    pausado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
+    # None = pausado indefinidamente, hasta que alguien mande /reanudar a mano
+    pausado_hasta: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 async def inicializar_db():
     """Crea las tablas si no existen."""
     async with engine.begin() as conn:
@@ -169,3 +186,68 @@ async def limpiar_historial(telefono: str):
     async with async_session() as session:
         await session.execute(delete(Mensaje).where(Mensaje.telefono == telefono))
         await session.commit()
+
+
+async def pausar_conversacion(telefono: str, horas: float | None = None):
+    """
+    Pausa el bot para este telefono: deja de responder automaticamente.
+
+    Si "horas" es None, queda pausado indefinidamente hasta que alguien mande
+    /reanudar. Si se da un numero, se reanuda solo despues de esas horas.
+    """
+    hasta = ahora() + timedelta(hours=horas) if horas else None
+    async with async_session() as session:
+        existente = await session.get(ConversacionPausada, telefono)
+        if existente:
+            existente.pausado_en = ahora()
+            existente.pausado_hasta = hasta
+        else:
+            session.add(ConversacionPausada(telefono=telefono, pausado_en=ahora(), pausado_hasta=hasta))
+        await session.commit()
+
+
+async def reanudar_conversacion(telefono: str) -> bool:
+    """Quita la pausa de un telefono. Retorna True si de verdad estaba pausado."""
+    async with async_session() as session:
+        existente = await session.get(ConversacionPausada, telefono)
+        if not existente:
+            return False
+        await session.delete(existente)
+        await session.commit()
+        return True
+
+
+async def esta_pausada(telefono: str) -> bool:
+    """
+    True si el bot NO debe responder a este telefono ahora mismo.
+
+    Si la pausa ya vencio (pausado_hasta quedo en el pasado), se limpia sola aca
+    y se reanuda: asi "/pausar X 2" de verdad dura solo 2 horas sin que nadie
+    tenga que acordarse de reanudar a mano.
+    """
+    async with async_session() as session:
+        existente = await session.get(ConversacionPausada, telefono)
+        if not existente:
+            return False
+        pausado_hasta = existente.pausado_hasta
+        # SQLite no conserva la zona horaria al guardar: al leerlo de vuelta viene
+        # "naive" aunque se haya guardado como aware. Sin esto, comparar contra
+        # ahora() (aware) truena con TypeError.
+        if pausado_hasta and pausado_hasta.tzinfo is None:
+            pausado_hasta = pausado_hasta.replace(tzinfo=timezone.utc)
+        if pausado_hasta and pausado_hasta < ahora():
+            await session.delete(existente)
+            await session.commit()
+            return False
+        return True
+
+
+async def listar_pausadas() -> list[dict]:
+    """Todas las conversaciones pausadas ahora mismo, para el comando /estado."""
+    async with async_session() as session:
+        resultado = await session.execute(select(ConversacionPausada))
+        filas = list(resultado.scalars().all())
+    return [
+        {"telefono": f.telefono, "pausado_en": f.pausado_en, "pausado_hasta": f.pausado_hasta}
+        for f in filas
+    ]

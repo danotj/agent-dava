@@ -18,12 +18,16 @@ from fastapi.responses import PlainTextResponse
 
 from agent.brain import generar_respuesta, obtener_mensaje_error
 from agent.memory import (
+    esta_pausada,
     guardar_mensaje,
     inicializar_db,
     liberar_evento,
     limpiar_eventos_viejos,
+    listar_pausadas,
     marcar_evento_procesado,
     obtener_historial,
+    pausar_conversacion,
+    reanudar_conversacion,
 )
 from agent.providers import obtener_proveedor
 from agent.providers.base import MensajeEntrante
@@ -44,6 +48,71 @@ logger = logging.getLogger("agentkit")
 logger.setLevel(logging.DEBUG if ENVIRONMENT == "development" else logging.INFO)
 
 PORT = int(os.getenv("PORT", "8000"))
+
+# Numeros del equipo de DavaDigital que pueden mandarle comandos al bot (/pausar,
+# /reanudar, /estado) para tomar el control de una conversacion a mano. Se
+# configuran en .env como ADMIN_PHONE_NUMBERS, separados por coma.
+ADMIN_PHONE_NUMBERS = {
+    numero.strip().lstrip("+")
+    for numero in os.getenv("ADMIN_PHONE_NUMBERS", "").split(",")
+    if numero.strip()
+}
+if not ADMIN_PHONE_NUMBERS:
+    logger.warning(
+        "ADMIN_PHONE_NUMBERS no esta configurado: nadie va a poder usar "
+        "/pausar, /reanudar o /estado para tomar conversaciones a mano."
+    )
+
+
+async def manejar_comando_admin(texto: str) -> str | None:
+    """
+    Interpreta un comando de un numero admin (/pausar, /reanudar, /estado).
+
+    Retorna el texto de confirmacion a mandarle de vuelta al admin, o None si el
+    mensaje no empieza con "/" (no es un comando: el admin esta hablando normal,
+    por ejemplo probando el bot como si fuera cliente).
+    """
+    texto = texto.strip()
+    if not texto.startswith("/"):
+        return None
+
+    partes = texto.split()
+    comando = partes[0].lower()
+
+    if comando == "/pausar":
+        if len(partes) < 2:
+            return "Uso: /pausar <telefono> [horas]\nEj: /pausar 5215512345678 2"
+        telefono = partes[1].lstrip("+")
+        horas = None
+        if len(partes) >= 3:
+            try:
+                horas = float(partes[2])
+            except ValueError:
+                return f"'{partes[2]}' no es un numero valido de horas."
+        await pausar_conversacion(telefono, horas)
+        vigencia = f"por {horas}h" if horas else "hasta que mandes /reanudar"
+        return f"Bot pausado para {telefono} ({vigencia}). No le va a responder automatico."
+
+    if comando == "/reanudar":
+        if len(partes) < 2:
+            return "Uso: /reanudar <telefono>"
+        telefono = partes[1].lstrip("+")
+        ok = await reanudar_conversacion(telefono)
+        return f"Bot reanudado para {telefono}." if ok else f"{telefono} no estaba pausado."
+
+    if comando == "/estado":
+        pausadas = await listar_pausadas()
+        if not pausadas:
+            return "No hay conversaciones pausadas ahora mismo."
+        lineas = []
+        for p in pausadas:
+            vigencia = (
+                p["pausado_hasta"].strftime("%d/%m %H:%M") if p["pausado_hasta"] else "indefinido"
+            )
+            lineas.append(f"- {p['telefono']} (hasta: {vigencia})")
+        return "Conversaciones pausadas:\n" + "\n".join(lineas)
+
+    return f"Comando no reconocido: {comando}\nComandos: /pausar, /reanudar, /estado"
 
 # Un candado por numero de telefono. En WhatsApp es normal que alguien mande "hola" y
 # medio segundo despues la pregunta de verdad: sin esto los dos mensajes se procesarian
@@ -173,9 +242,27 @@ async def procesar_mensaje(msg: MensajeEntrante):
     atienden en orden, no en paralelo, para que el historial no se mezcle.
     """
     evento_id = msg.contexto.get("evento_id") or msg.mensaje_id
+    telefono_normalizado = msg.telefono.lstrip("+")
 
     async with _candados[msg.telefono]:
         try:
+            # Comandos de administrador (/pausar, /reanudar, /estado): solo si el
+            # mensaje viene de un numero en ADMIN_PHONE_NUMBERS Y empieza con "/".
+            # No pasan por el LLM ni se guardan en el historial del cliente.
+            if telefono_normalizado in ADMIN_PHONE_NUMBERS:
+                respuesta_comando = await manejar_comando_admin(msg.texto)
+                if respuesta_comando is not None:
+                    await proveedor.enviar_mensaje(msg.telefono, respuesta_comando, msg.contexto)
+                    logger.info(f"Comando de admin ejecutado por {msg.telefono}: {msg.texto}")
+                    return
+
+            # Si alguien del equipo tomo esta conversacion a mano (/pausar), el bot
+            # se queda callado: no llama al LLM ni responde. El evento ya se marco
+            # como procesado en el webhook, asi que no se reintenta de mas.
+            if await esta_pausada(msg.telefono):
+                logger.info(f"Conversacion pausada, el bot no responde: {msg.telefono}")
+                return
+
             # El historial se lee ANTES de guardar el mensaje actual: brain.py agrega
             # el mensaje nuevo al final, y asi no queda duplicado.
             historial = await obtener_historial(msg.telefono)

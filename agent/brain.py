@@ -41,7 +41,14 @@ if LLM_PROVIDER not in PROVEEDORES_LLM_SOPORTADOS:
 
 # ── Anthropic ────────────────────────────────────────────────────────────
 
-client_anthropic = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+# timeout mas alto y mas reintentos que el default del SDK (2): en Railway, justo
+# despues de un deploy nuevo, a veces hay baches breves de DNS/red de salida hacia
+# api.anthropic.com. Esto le da mas margen antes de rendirse.
+client_anthropic = AsyncAnthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    timeout=60.0,
+    max_retries=4,
+)
 
 # El modelo se cambia desde .env, sin tocar el codigo.
 #   claude-opus-5     el mas capaz             $5 / $25 por millon de tokens
@@ -64,8 +71,11 @@ _soporta_esfuerzo = True
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
-# "deepseek-chat" (V3) para respuestas rapidas, "deepseek-reasoner" (R1) si necesita razonar mas
-MODELO_DEEPSEEK = os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
+# "deepseek-chat" y "deepseek-reasoner" quedaron retirados el 24 de julio de 2026.
+# Los reemplazos oficiales:
+#   deepseek-v4-flash  -> rapido y barato (equivalente al viejo "deepseek-chat")
+#   deepseek-v4-pro    -> razona mas, contexto de 1M tokens (equivalente a "deepseek-reasoner")
+MODELO_DEEPSEEK = os.getenv("DEEPSEEK_MODEL") or "deepseek-v4-flash"
 
 if LLM_PROVIDER == "deepseek" and not DEEPSEEK_API_KEY:
     logger.warning("LLM_PROVIDER=deepseek pero falta DEEPSEEK_API_KEY: el agente no va a poder responder")
