@@ -11,6 +11,7 @@ import logging
 import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -25,6 +26,7 @@ from agent.memory import (
     limpiar_eventos_viejos,
     listar_pausadas,
     marcar_evento_procesado,
+    obtener_conversaciones_recientes,
     obtener_historial,
     pausar_conversacion,
     reanudar_conversacion,
@@ -64,15 +66,60 @@ if not ADMIN_PHONE_NUMBERS:
     )
 
 
-async def manejar_comando_admin(texto: str) -> str | None:
+# Cuando un admin manda "/pausar" SIN numero, le mostramos una lista corta de las
+# conversaciones mas recientes y espera a que responda solo con el indice (ej "2").
+# Este diccionario guarda, por admin, que lista le mostramos y cuando, para poder
+# interpretar su siguiente mensaje como una seleccion en vez de charla normal.
+_seleccion_pendiente: dict[str, dict] = {}
+SELECCION_VIGENCIA_SEGUNDOS = 300  # 5 minutos: pasado eso, un numero suelto ya no cuenta como seleccion
+
+# Guarda el ultimo contexto (conversation_id, account_id) con el que cada admin le
+# escribio al bot. Se usa para poder avisarle de forma proactiva ("un cliente pidio
+# hablar con alguien") sin que el admin tenga que estar activamente chateando en
+# ese momento. Si un admin nunca le escribio al bot, no hay contexto y no se le
+# puede avisar (WhatsApp exige una conversacion existente para poder escribirle).
+_admin_contexto: dict[str, dict] = {}
+
+
+async def manejar_mensaje_admin(telefono_admin: str, texto: str) -> str | None:
     """
-    Interpreta un comando de un numero admin (/pausar, /reanudar, /estado).
+    Interpreta un mensaje de un numero admin: puede ser un comando (/pausar,
+    /reanudar, /estado) o la seleccion numerica de un "/pausar" sin numero previo.
 
     Retorna el texto de confirmacion a mandarle de vuelta al admin, o None si el
-    mensaje no empieza con "/" (no es un comando: el admin esta hablando normal,
-    por ejemplo probando el bot como si fuera cliente).
+    mensaje no es ni un comando ni una seleccion pendiente (el admin esta hablando
+    normal, por ejemplo probando el bot como si fuera cliente).
     """
     texto = texto.strip()
+
+    # ¿Hay una lista pendiente para este admin y mando solo un numero (o numero+horas)?
+    pendiente = _seleccion_pendiente.get(telefono_admin)
+    if pendiente and texto.split() and texto.split()[0].isdigit():
+        vigente = (
+            datetime.now(timezone.utc) - pendiente["creado_en"]
+        ).total_seconds() < SELECCION_VIGENCIA_SEGUNDOS
+        partes_sel = texto.split()
+        indice = int(partes_sel[0])
+
+        if not vigente:
+            _seleccion_pendiente.pop(telefono_admin, None)
+            # sigue de largo: se procesa como comando normal abajo (probablemente
+            # tampoco empieza con "/", asi que terminara devolviendo None)
+        elif 1 <= indice <= len(pendiente["opciones"]):
+            telefono_elegido = pendiente["opciones"][indice - 1]
+            horas = None
+            if len(partes_sel) >= 2:
+                try:
+                    horas = float(partes_sel[1])
+                except ValueError:
+                    pass
+            await pausar_conversacion(telefono_elegido, horas)
+            _seleccion_pendiente.pop(telefono_admin, None)
+            vigencia = f"por {horas}h" if horas else "hasta que mandes /reanudar"
+            return f"Bot pausado para {telefono_elegido} ({vigencia})."
+        else:
+            return f"'{indice}' no es un numero valido de la lista. Manda /pausar de nuevo para ver las opciones."
+
     if not texto.startswith("/"):
         return None
 
@@ -81,7 +128,18 @@ async def manejar_comando_admin(texto: str) -> str | None:
 
     if comando == "/pausar":
         if len(partes) < 2:
-            return "Uso: /pausar <telefono> [horas]\nEj: /pausar 5215512345678 2"
+            recientes = await obtener_conversaciones_recientes(8)
+            if not recientes:
+                return "No hay conversaciones recientes para pausar."
+            _seleccion_pendiente[telefono_admin] = {
+                "opciones": [r["telefono"] for r in recientes],
+                "creado_en": datetime.now(timezone.utc),
+            }
+            lineas = [f'{i}. {r["telefono"]} - "{r["preview"]}"' for i, r in enumerate(recientes, start=1)]
+            return (
+                "¿A quién pauso? Responde solo con el número (opcional: número y horas, ej '2 3'):\n"
+                + "\n".join(lineas)
+            )
         telefono = partes[1].lstrip("+")
         horas = None
         if len(partes) >= 3:
@@ -246,11 +304,15 @@ async def procesar_mensaje(msg: MensajeEntrante):
 
     async with _candados[msg.telefono]:
         try:
-            # Comandos de administrador (/pausar, /reanudar, /estado): solo si el
-            # mensaje viene de un numero en ADMIN_PHONE_NUMBERS Y empieza con "/".
-            # No pasan por el LLM ni se guardan en el historial del cliente.
+            # Comandos/seleccion de administrador: solo si el mensaje viene de un
+            # numero en ADMIN_PHONE_NUMBERS. No pasan por el LLM ni se guardan en
+            # el historial del cliente.
             if telefono_normalizado in ADMIN_PHONE_NUMBERS:
-                respuesta_comando = await manejar_comando_admin(msg.texto)
+                # Guardamos su contexto mas reciente para poder avisarle despues
+                # de forma proactiva (ej. "un cliente pidio hablar con alguien").
+                _admin_contexto[telefono_normalizado] = msg.contexto
+
+                respuesta_comando = await manejar_mensaje_admin(telefono_normalizado, msg.texto)
                 if respuesta_comando is not None:
                     await proveedor.enviar_mensaje(msg.telefono, respuesta_comando, msg.contexto)
                     logger.info(f"Comando de admin ejecutado por {msg.telefono}: {msg.texto}")
@@ -266,7 +328,7 @@ async def procesar_mensaje(msg: MensajeEntrante):
             # El historial se lee ANTES de guardar el mensaje actual: brain.py agrega
             # el mensaje nuevo al final, y asi no queda duplicado.
             historial = await obtener_historial(msg.telefono)
-            respuesta, es_respuesta_real = await generar_respuesta(msg.texto, historial)
+            respuesta, es_respuesta_real, necesita_humano = await generar_respuesta(msg.texto, historial)
 
             enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta, msg.contexto)
 
@@ -287,6 +349,25 @@ async def procesar_mensaje(msg: MensajeEntrante):
                 await guardar_mensaje(msg.telefono, "assistant", respuesta)
 
             logger.info(f"Respuesta enviada a {msg.telefono}: {respuesta}")
+
+            # El cliente pidio hablar con una persona: pausamos su conversacion sola
+            # (indefinido, hasta que el equipo la reanude a mano) y avisamos a los
+            # admins que tengan un contexto guardado (los que le han escrito al bot
+            # antes; sin eso no hay forma de mandarles un mensaje nuevo por WhatsApp).
+            if necesita_humano:
+                await pausar_conversacion(msg.telefono)
+                logger.info(f"Handoff automatico: se pauso la conversacion con {msg.telefono}")
+                for admin_tel, contexto_admin in _admin_contexto.items():
+                    try:
+                        await proveedor.enviar_mensaje(
+                            admin_tel,
+                            f"🔔 El cliente {msg.telefono} pidió hablar con alguien del equipo. "
+                            f"Ya pausé el bot para esa conversación. Cuando termines, manda "
+                            f"/reanudar {msg.telefono}.",
+                            contexto_admin,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.error(f"No se pudo avisarle al admin {admin_tel} del handoff")
 
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Error procesando el mensaje de {msg.telefono}: {e}")

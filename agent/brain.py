@@ -25,6 +25,11 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger("agentkit")
 
+# Marca invisible que Dano agrega al final de su respuesta cuando el cliente pide
+# hablar con una persona. main.py la detecta, la quita del texto antes de mandarlo,
+# y pausa la conversacion sola. El cliente nunca ve este texto.
+MARCA_HANDOFF_HUMANO = "[[HANDOFF_HUMANO]]"
+
 # ─────────────────────────────────────────────────────────────────────────
 # Proveedor de IA
 # ─────────────────────────────────────────────────────────────────────────
@@ -243,7 +248,7 @@ async def _generar_deepseek(mensajes: list[dict], system_prompt: str) -> str | N
     return (texto or "").strip() or None
 
 
-async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, bool]:
+async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, bool, bool]:
     """
     Genera una respuesta usando el proveedor de IA configurado (LLM_PROVIDER).
 
@@ -252,15 +257,20 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
         historial: los mensajes anteriores, [{"role": "user"|"assistant", "content": "..."}]
 
     Returns:
-        (texto, es_respuesta_real)
+        (texto, es_respuesta_real, necesita_humano)
 
         "es_respuesta_real" es False cuando lo que se devuelve es un aviso tecnico
         (error o fallback) y no una respuesta del agente. main.py lo usa para no
         guardar esos avisos en el historial: si se guardaran, quedarian contaminando
         el contexto de todos los mensajes siguientes.
+
+        "necesita_humano" es True cuando el cliente pidio explicitamente hablar con
+        una persona y Dano incluyo la marca MARCA_HANDOFF_HUMANO en su respuesta
+        (ya viene quitada del texto). main.py usa esto para pausar la conversacion
+        sola y avisarle al equipo.
     """
     if not mensaje or len(mensaje.strip()) < 2:
-        return obtener_mensaje_fallback(), False
+        return obtener_mensaje_fallback(), False, False
 
     mensajes = [{"role": m["role"], "content": m["content"]} for m in historial]
     mensajes.append({"role": "user", "content": mensaje})
@@ -274,6 +284,11 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
 
     if not texto:
         logger.warning(f"El proveedor '{LLM_PROVIDER}' no devolvio una respuesta valida")
-        return obtener_mensaje_error(), False
+        return obtener_mensaje_error(), False, False
 
-    return texto, True
+    necesita_humano = MARCA_HANDOFF_HUMANO in texto
+    if necesita_humano:
+        texto = texto.replace(MARCA_HANDOFF_HUMANO, "").strip()
+        logger.info("El cliente pidio hablar con un humano; se marca para pausar la conversacion")
+
+    return texto, True, necesita_humano

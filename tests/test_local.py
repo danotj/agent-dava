@@ -64,8 +64,10 @@ async def main():
         historial = await obtener_historial(TELEFONO_TEST)
 
         print("\nDano: ", end="", flush=True)
-        respuesta, es_respuesta_real = await generar_respuesta(mensaje, historial)
+        respuesta, es_respuesta_real, necesita_humano = await generar_respuesta(mensaje, historial)
         print(respuesta)
+        if necesita_humano:
+            print("[El bot marco esta conversacion para pasarla a un humano]")
         print()
 
         # Igual que en produccion: los avisos tecnicos no entran al historial

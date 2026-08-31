@@ -13,7 +13,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from sqlalchemy import DateTime, Integer, String, Text, delete, select
+from sqlalchemy import DateTime, Integer, String, Text, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -251,3 +251,26 @@ async def listar_pausadas() -> list[dict]:
         {"telefono": f.telefono, "pausado_en": f.pausado_en, "pausado_hasta": f.pausado_hasta}
         for f in filas
     ]
+
+
+async def obtener_conversaciones_recientes(limite: int = 8) -> list[dict]:
+    """
+    Los ultimos N telefonos que le escribieron a Dano, mas recientes primero, cada
+    uno con un preview de su ultimo mensaje. Se usa para el flujo de "/pausar" sin
+    numero: el admin ve una lista corta y elige por indice en vez de tipear el
+    telefono a mano.
+    """
+    async with async_session() as session:
+        # subconsulta: el id del mensaje mas reciente de cada telefono (de cliente,
+        # no de las respuestas del propio bot)
+        subq = (
+            select(func.max(Mensaje.id).label("ultimo_id"))
+            .where(Mensaje.role == "user")
+            .group_by(Mensaje.telefono)
+            .subquery()
+        )
+        resultado = await session.execute(
+            select(Mensaje).where(Mensaje.id.in_(select(subq.c.ultimo_id))).order_by(Mensaje.id.desc()).limit(limite)
+        )
+        filas = list(resultado.scalars().all())
+    return [{"telefono": f.telefono, "preview": f.content[:60], "timestamp": f.timestamp} for f in filas]
